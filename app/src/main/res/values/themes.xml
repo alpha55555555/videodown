@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base application theme -->
+    <style name="Theme.DouyinDownloader" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#FE2C55</item>
+    </style>
+
+    <!-- Splash Screen theme -->
+    <style name="Theme.App.Starting" parent="Theme.SplashScreen">
+        <!-- Background of the splash screen -->
+        <item name="windowSplashScreenBackground">#FE2C55</item>
+        <!-- Icon of the splash screen -->
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <!-- The theme to switch to after the splash screen is done -->
+        <item name="postSplashScreenTheme">@style/Theme.DouyinDownloader</item>
+    </style>
+</resources>
