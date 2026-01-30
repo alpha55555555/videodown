@@ -1,6 +1,6 @@
-# TikDown - 强大的全能媒体下载器 (Advanced Media Downloader)
+# videodownloader - 强大的全能媒体下载器
 
-TikDown 是一款基于 Android (Kotlin + Jetpack Compose) 开发的高级媒体下载工具，专为解决复杂场景下的视频下载需求而设计。除了传统的链接解析功能外，它还内置了强大的“网页嗅探器 (Smart Sniffer)”，能够自动捕获并下载网页中的视频和高清图片资源。
+videodownloader 是一款基于 Android (Kotlin + Jetpack Compose) 开发的高级媒体下载工具，专为解决复杂场景下的视频下载需求而设计。除了传统的链接解析功能外，它还内置了强大的“网页嗅探器 (Smart Sniffer)”，能够自动捕获并下载网页中的视频和高清图片资源。
 
 ## ✨ 核心功能 (Key Features)
 
