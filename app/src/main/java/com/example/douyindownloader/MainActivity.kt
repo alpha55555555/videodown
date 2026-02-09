@@ -43,6 +43,15 @@ import org.json.JSONArray
 import java.io.File
 import java.io.FileOutputStream
 import java.util.regex.Pattern
+import java.util.concurrent.TimeUnit
+
+// Global OkHttpClient to share connection pool and reduce resource usage
+val globalOkHttpClient = OkHttpClient.Builder()
+    .followRedirects(true)
+    .connectTimeout(30, TimeUnit.SECONDS)
+    .readTimeout(60, TimeUnit.SECONDS)
+    .retryOnConnectionFailure(true)
+    .build()
 
 // 数据类：严格定义参数顺序
 data class DownloadHistory(
@@ -51,23 +60,24 @@ data class DownloadHistory(
     val time: Long,
     val status: Int, // 0: Downloading, 1: Success, 2: Failed
     val url: String,
-    val origin: String = "" // Original Share Link
+    val origin: String = "", // Original Share Link
+    val progress: Float = 0f
 )
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
-        setContent { TikDownApp() }
+        setContent { videodownApp() }
     }
 }
 
 @Composable
-fun TikDownApp() {
+fun videodownApp() {
     val context = LocalContext.current
     var currentTab by remember { mutableStateOf(0) }
     val history = remember { mutableStateListOf<DownloadHistory>() }
-    var saveDir by remember { mutableStateOf("TikDownData") }
+    var saveDir by remember { mutableStateOf("videodownData") }
 
     // Hoisted State for Input
     var downloadInput by remember { mutableStateOf("") }
@@ -102,35 +112,53 @@ fun TikDownApp() {
     }
 
     // Helper Function to handle download and history
-    fun startDownloadTask(url: String, baseName: String, shouldStopSniffer: Boolean = false, originUrl: String = "") {
+    fun startDownloadTask(url: String, baseName: String, originUrl: String = "") {
+        // Removed: if (shouldStopSniffer) { isRunning = false; snifferUrl = null }
+        // Let the Auto-Stop Monitor handle stopping to allow multi-resource capture
+        status = "任务已添加"
+
         scope.launch {
             val tempName = "${baseName}...".replace("Media...", "Media...")
-            val newItem = DownloadHistory(tempName, "", System.currentTimeMillis(), 0, url, originUrl)
+            val newItem = DownloadHistory(tempName, "", System.currentTimeMillis(), 0, url, originUrl, 0f)
             history.add(0, newItem)
             
-            status = "⬇️ 正在下载: $baseName"
-            
-            // performDownload handles extension detection
-            // Note: We use a temp filename first, performDownload adds extension
-            val tempFilePrefix = "${baseName}_${System.currentTimeMillis() % 100000}"
-            val res = performDownload(context, url, tempFilePrefix, saveDir, targetUA)
-            
-            val index = history.indexOf(newItem)
-            if (index != -1) {
-                if (res != null) {
-                    val savedName = File(res).name
-                    history[index] = newItem.copy(name = savedName, path = res, status = 1)
-                    status = "✅ 下载成功: $savedName"
-                    saveHistory(context, history)
-                    
-                    if (shouldStopSniffer) {
-                        isRunning = false
-                        snifferUrl = null
+            try {
+                // performDownload handles extension detection
+                val tempFilePrefix = "${baseName}_${System.currentTimeMillis() % 100000}"
+                val res = performDownload(context, url, tempFilePrefix, saveDir, targetUA) { progress ->
+                    scope.launch {
+                        val idx = history.indexOfFirst { it.time == newItem.time }
+                        if (idx != -1) {
+                            history[idx] = history[idx].copy(progress = progress)
+                        }
                     }
-                } else {
-                    history[index] = newItem.copy(status = 2)
-                    status = "❌ 下载失败"
-                    saveHistory(context, history)
+                }
+                
+                val index = history.indexOfFirst { it.time == newItem.time }
+                if (index != -1) {
+                    if (res != null) {
+                        val savedName = File(res).name
+                        history[index] = newItem.copy(name = savedName, path = res, status = 1, progress = 1f)
+                        status = "✅ 下载成功: $savedName"
+                        withContext(Dispatchers.IO) {
+                            saveHistory(context, history)
+                        }
+                    } else {
+                        history[index] = newItem.copy(status = 2, progress = 0f)
+                        status = "❌ 下载失败 (资源无效或网络错误)"
+                        withContext(Dispatchers.IO) {
+                            saveHistory(context, history)
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.e("videodown", "Download Error", e)
+                val index = history.indexOfFirst { it.time == newItem.time }
+                if (index != -1) {
+                    history[index] = newItem.copy(status = 2, progress = 0f)
+                    withContext(Dispatchers.IO) {
+                        saveHistory(context, history)
+                    }
                 }
             }
         }
@@ -174,8 +202,7 @@ fun TikDownApp() {
 
                                     status = "已抓取: ...${finalMediaUrl.takeLast(15)}"
                                     
-                                    val isVideo = finalMediaUrl.contains(".mp4") || finalMediaUrl.contains("video")
-                                    startDownloadTask(finalMediaUrl, pendingBaseName, isVideo, processingOrigin)
+                                    startDownloadTask(finalMediaUrl, pendingBaseName, processingOrigin)
                                 }
                             }
                         }
@@ -255,7 +282,7 @@ fun TikDownApp() {
                                         }
                                     }
                                 }
-                            }, 1000);
+                            }, 2000);
                         """.trimIndent()
                         view?.evaluateJavascript(js, null)
                     }
@@ -265,7 +292,7 @@ fun TikDownApp() {
                         // Check for Video OR Image
                         val isVideo = u.contains("aweme/v1/play/") || u.contains("video_id") || (u.contains(".mp4") && !u.contains(".js")) || (u.contains("video.twimg.com") && u.contains(".mp4"))
                         // Strict Image Filter (No PNG)
-                        val isImage = (u.contains("douyinpic.com") || u.matches(Regex(".*\\.(jpg|jpeg|webp).*"))) && 
+                        val isImage = (u.contains("douyinpic.com") || u.matches(Regex(".*\\.(jpg|jpeg|webp|gif).*"))) && 
                                       !u.contains(".png") &&
                                       !u.contains("avatar") && 
                                       !u.contains("emoji") && 
@@ -283,7 +310,7 @@ fun TikDownApp() {
                                         processedUrls.add(finalMediaUrl)
                                         lastActivityTime = System.currentTimeMillis()
                                         
-                                        startDownloadTask(finalMediaUrl, pendingBaseName, isVideo, processingOrigin)
+                                        startDownloadTask(finalMediaUrl, pendingBaseName, processingOrigin)
                                     }
                                 }
                             }
@@ -346,7 +373,7 @@ fun TikDownApp() {
                                     val mediaUrl = fetchTwitterVideo(url)
                                     if (mediaUrl != null) {
                                         status = "正在下载原片..."
-                                        startDownloadTask(mediaUrl, baseName, true, origin)
+                                        startDownloadTask(mediaUrl, baseName, origin)
                                     } else {
                                         snifferUrl = url
                                         status = "API 失败，切换网页嗅探..."
@@ -480,10 +507,9 @@ fun DownloaderTab(
                     Toast.makeText(context, "内容为空", Toast.LENGTH_SHORT).show()
                 }
             },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = !isRunning
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (isRunning) "请稍后" else "粘贴并解析下载")
+            Text("粘贴并解析下载")
         }
     }
 }
@@ -492,9 +518,33 @@ fun DownloaderTab(
 fun HistoryTab(history: List<DownloadHistory>, onRedownload: (DownloadHistory) -> Unit) {
     val context = LocalContext.current
     var playingVideoPath by remember { mutableStateOf<String?>(null) }
+    // State to track expanded groups: Map<Url, Boolean>
+    val expandedGroups = remember { mutableStateMapOf<String, Boolean>() }
+
+    // Logic to process history into display list
+    val displayList = remember(history.toList()) {
+        val processed = mutableListOf<Any>()
+        // Group by combination of URL and Status to separate success/fail groups
+        val groups = history.groupBy { "${it.url}_${it.status}" }
+        val addedKeys = mutableSetOf<String>()
+        
+        history.forEach { item ->
+            val key = "${item.url}_${item.status}"
+            val group = groups[key] ?: emptyList()
+            if (group.size > 1) {
+                if (!addedKeys.contains(key)) {
+                    processed.add(group) // Add the specific status group
+                    addedKeys.add(key)
+                }
+            } else {
+                processed.add(item)
+            }
+        }
+        processed
+    }
 
     if (playingVideoPath != null) {
-        val isImage = playingVideoPath!!.endsWith(".webp") || playingVideoPath!!.endsWith(".jpg") || playingVideoPath!!.endsWith(".png")
+        val isImage = playingVideoPath!!.endsWith(".webp") || playingVideoPath!!.endsWith(".jpg") || playingVideoPath!!.endsWith(".png") || playingVideoPath!!.endsWith(".gif")
         
         AlertDialog(
             onDismissRequest = { playingVideoPath = null },
@@ -526,34 +576,141 @@ fun HistoryTab(history: List<DownloadHistory>, onRedownload: (DownloadHistory) -
         Text("历史记录", fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(16.dp))
         LazyColumn {
-            items(history) { item ->
-                Row(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(modifier = Modifier.weight(1f).clickable { 
-                        if (item.status == 1) playingVideoPath = item.path 
-                    }) {
-                        Text(item.name, color = if (item.status == 1) Color.Black else if (item.status == 0) Color.Blue else Color.Red)
-                        Text(java.text.SimpleDateFormat("yyyy-MM-dd HH:mm").format(item.time), fontSize = 11.sp, color = Color.Gray)
-                        if (item.status == 0) {
-                            Text("下载中...", fontSize = 10.sp, color = Color.Blue)
-                        } else if (item.status == 2) {
-                            Text("下载失败", fontSize = 10.sp, color = Color.Red)
-                        }
-                        if (item.origin.isNotBlank()) {
-                            Text("来源: 可重新解析", fontSize = 9.sp, color = Color.Gray)
-                        }
-                    }
+            items(displayList) { item ->
+                if (item is List<*>) {
+                    // Group of multiple items for one URL and SAME status
+                    val groupItems = item as List<DownloadHistory>
+                    val firstItem = groupItems.first()
+                    // Unique key for expansion state based on URL and Status
+                    val groupKey = "${firstItem.url}_${firstItem.status}"
+                    val isExpanded = expandedGroups[groupKey] == true
                     
-                    if (item.status == 1) {
-                         IconButton(onClick = { playingVideoPath = item.path }) {
-                             Icon(Icons.Default.PlayArrow, contentDescription = "预览")
-                         }
+                    val statusLabel = when(firstItem.status) {
+                        1 -> "下载成功"
+                        2 -> "下载失败"
+                        else -> "正在下载"
                     }
-                    
-                    IconButton(onClick = { onRedownload(item) }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "重新下载")
+                    val cardBg = when(firstItem.status) {
+                        1 -> Color(0xFFE8F5E9) // Light Green
+                        2 -> Color(0xFFFFEBEE) // Light Red
+                        else -> Color(0xFFE3F2FD) // Light Blue
                     }
+                    val themeColor = when(firstItem.status) {
+                        1 -> Color(0xFF4CAF50)
+                        2 -> Color(0xFFF44336)
+                        else -> Color(0xFF2196F3)
+                    }
+
+                    Column(modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(cardBg)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { expandedGroups[groupKey] = !isExpanded }
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, 
+                                "Expand",
+                                tint = themeColor
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "$statusLabel (${groupItems.size} 个任务)",
+                                    color = themeColor,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp
+                                )
+                                Text("来源: ...${firstItem.url.takeLast(25)}", fontSize = 10.sp, color = Color.Gray)
+                            }
+                        }
+                        
+                        if (isExpanded) {
+                            groupItems.forEach { subItem ->
+                                Divider(color = Color.White.copy(alpha = 0.5f), thickness = 1.dp)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f).clickable {
+                                        if (subItem.status == 1) playingVideoPath = subItem.path
+                                    }) {
+                                        Text(
+                                            text = subItem.name, 
+                                            fontSize = 12.sp, 
+                                            color = when(subItem.status) {
+                                                0 -> Color.Blue
+                                                1 -> Color.Black
+                                                else -> Color.Red
+                                            },
+                                            maxLines = 1
+                                        )
+                                        if (subItem.status == 0) {
+                                            if (subItem.progress >= 0f) {
+                                                LinearProgressIndicator(progress = subItem.progress, modifier = Modifier.fillMaxWidth().height(2.dp), color = themeColor)
+                                            } else {
+                                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp), color = themeColor)
+                                            }
+                                        }
+                                        Text(java.text.SimpleDateFormat("MM-dd HH:mm").format(subItem.time), fontSize = 9.sp, color = Color.Gray)
+                                    }
+                                    
+                                    if (subItem.status == 1) {
+                                        IconButton(onClick = { playingVideoPath = subItem.path }, modifier = Modifier.size(32.dp)) {
+                                            Icon(Icons.Default.PlayArrow, "Preview", modifier = Modifier.size(18.dp), tint = themeColor)
+                                        }
+                                    }
+                                    
+                                    IconButton(onClick = { onRedownload(subItem) }, modifier = Modifier.size(32.dp)) {
+                                        Icon(Icons.Default.Refresh, "Retry", tint = themeColor, modifier = Modifier.size(18.dp))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (item is DownloadHistory) {
+                    // Normal Single Item
+                    Row(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f).clickable { 
+                            if (item.status == 1) playingVideoPath = item.path 
+                        }) {
+                            Text(item.name, color = if (item.status == 1) Color.Black else if (item.status == 0) Color.Blue else Color.Red)
+                            Text(java.text.SimpleDateFormat("yyyy-MM-dd HH:mm").format(item.time), fontSize = 11.sp, color = Color.Gray)
+                            if (item.status == 0) {
+                                Text("下载中...", fontSize = 10.sp, color = Color.Blue)
+                                if (item.progress >= 0f) {
+                                    LinearProgressIndicator(progress = item.progress, modifier = Modifier.fillMaxWidth().height(4.dp))
+                                } else {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(4.dp))
+                                }
+                            } else if (item.status == 2) {
+                                Text("下载失败", fontSize = 10.sp, color = Color.Red)
+                            }
+                            if (item.origin.isNotBlank()) {
+                                Text("来源: 可重新解析", fontSize = 9.sp, color = Color.Gray)
+                            }
+                        }
+                        
+                        if (item.status == 1) {
+                             IconButton(onClick = { playingVideoPath = item.path }) {
+                                 Icon(Icons.Default.PlayArrow, contentDescription = "预览")
+                             }
+                        }
+                        
+                        IconButton(onClick = { onRedownload(item) }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "重新下载")
+                        }
+                    }
+                    Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFFEEEEEE)))
                 }
-                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFFEEEEEE)))
             }
         }
     }
@@ -594,51 +751,108 @@ suspend fun fetchTwitterVideo(url: String): String? {
     return withContext(Dispatchers.IO) {
         try {
             val api = url.replace("twitter.com", "api.vxtwitter.com").replace("x.com", "api.vxtwitter.com")
-            val resp = OkHttpClient().newCall(Request.Builder().url(api).build()).execute()
+            val resp = globalOkHttpClient.newCall(Request.Builder().url(api).build()).execute()
             val json = JSONObject(resp.body?.string() ?: "")
             json.getJSONArray("media_urls").getString(0)
         } catch (e: Exception) { null }
     }
 }
 
-suspend fun performDownload(ctx: Context, url: String, baseName: String, dir: String, ua: String): String? {
+suspend fun performDownload(ctx: Context, url: String, baseName: String, dir: String, ua: String, onProgress: (Float) -> Unit = {}): String? {
     return withContext(Dispatchers.IO) {
+        var response: okhttp3.Response? = null
         try {
-            val client = OkHttpClient.Builder().followRedirects(true).build()
-            val req = Request.Builder().url(url).header("User-Agent", ua)
-                .header("Referer", if (url.contains("twimg")) "https://x.com/" else "https://www.douyin.com/")
-                .build()
+            // 1. Determine dynamic Referer
+            val referer = when {
+                url.contains("douyin.com") || url.contains("iesdouyin.com") -> "https://www.douyin.com/"
+                url.contains("bilibili.com") || url.contains("bilivideo.com") || url.contains("hdslb.com") -> "https://www.bilibili.com/"
+                url.contains("twitter.com") || url.contains("x.com") || url.contains("twimg.com") -> "https://x.com/"
+                else -> url
+            }
+
+            // 2. Sync Cookies from WebView
+            val cookie = CookieManager.getInstance().getCookie(url)
+
+            val reqBuilder = Request.Builder()
+                .url(url)
+                .header("User-Agent", ua)
+                .header("Referer", referer)
+                .header("Range", "bytes=0-") // Essential for many video CDNs
+                .header("Connection", "keep-alive")
+
+            if (!cookie.isNullOrBlank()) {
+                reqBuilder.header("Cookie", cookie)
+            }
             
-            val response = client.newCall(req).execute()
-            if (!response.isSuccessful) return@withContext null
+            val req = reqBuilder.build()
+            response = globalOkHttpClient.newCall(req).execute()
+            
+            // Handle cases where 200 or 206 (Partial Content) is returned
+            if (!response.isSuccessful) {
+                Log.e("videodown", "Download failed with code: ${response.code}")
+                return@withContext null
+            }
             
             val contentType = response.header("Content-Type") ?: ""
-            if (contentType.contains("text/html")) return@withContext null
+            val body = response.body ?: return@withContext null
+            val total = body.contentLength()
+
+            // Relaxed check: Only block small HTML files. Large ones might be mislabeled media.
+            if (contentType.contains("text/html") && total < 100 * 1024) {
+                Log.w("videodown", "Blocked small HTML file: $url")
+                return@withContext null
+            }
             
             // STRICTLY BLOCK PNG
             if (contentType.contains("image/png")) return@withContext null
 
             val ext = when {
-                contentType.contains("video") -> ".mp4"
-                contentType.contains("image/jpeg") -> ".jpg"
-                contentType.contains("image/webp") -> ".webp"
+                contentType.contains("video") || url.contains(".mp4", ignoreCase = true) -> ".mp4"
+                contentType.contains("image/gif") || url.contains(".gif", ignoreCase = true) -> ".gif"
+                contentType.contains("image/jpeg") || url.contains(".jpg", ignoreCase = true) -> ".jpg"
+                contentType.contains("image/webp") || url.contains(".webp", ignoreCase = true) -> ".webp"
                 else -> ".mp4" // Fallback
             }
             
             val finalName = "${baseName}_${System.currentTimeMillis() % 10000}$ext"
-
             val folder = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), dir)
             if (!folder.exists()) folder.mkdirs()
             val file = File(folder, finalName)
             
-            response.body?.byteStream()?.use { input ->
-                FileOutputStream(file).use { output -> input.copyTo(output) }
+            body.byteStream().use { input ->
+                FileOutputStream(file).use { output -> 
+                    val buffer = ByteArray(8 * 1024)
+                    var bytesRead: Int
+                    var totalRead = 0L
+                    var lastProgressUpdate = 0L
+                    
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+                        
+                        val now = System.currentTimeMillis()
+                        if (now - lastProgressUpdate > 500) { // Throttle updates: max 2 times/sec
+                            lastProgressUpdate = now
+                            if (total > 0) {
+                                onProgress(totalRead.toFloat() / total)
+                            } else {
+                                onProgress(-1f) // Indeterminate
+                            }
+                        }
+                    }
+                    output.flush()
+                }
             }
             
             // 通知相册扫描新文件
             ctx.sendBroadcast(Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(file)))
             file.absolutePath
-        } catch (e: Exception) { null }
+        } catch (e: Exception) { 
+            Log.e("videodown", "PerformDownload Error: ${e.message}", e)
+            null 
+        } finally {
+            response?.close()
+        }
     }
 }
 
@@ -659,7 +873,7 @@ fun saveHistory(ctx: Context, list: List<DownloadHistory>) {
             obj.put("origin", it.origin)
             jsonArray.put(obj)
         }
-        ctx.getSharedPreferences("tikdown_prefs", Context.MODE_PRIVATE)
+        ctx.getSharedPreferences("videodown_prefs", Context.MODE_PRIVATE)
             .edit()
             .putString("history_json", jsonArray.toString())
             .apply()
@@ -669,14 +883,21 @@ fun saveHistory(ctx: Context, list: List<DownloadHistory>) {
 fun loadHistory(ctx: Context): List<DownloadHistory> {
     val list = mutableListOf<DownloadHistory>()
     try {
-        val jsonString = ctx.getSharedPreferences("tikdown_prefs", Context.MODE_PRIVATE)
+        val jsonString = ctx.getSharedPreferences("videodown_prefs", Context.MODE_PRIVATE)
             .getString("history_json", "[]") ?: "[]"
         val array = JSONArray(jsonString)
         for (i in 0 until array.length()) {
             val obj = array.getJSONObject(i)
             // Migration logic
-            val status = if (obj.has("status")) obj.getInt("status") 
+            var status = if (obj.has("status")) obj.getInt("status") 
                          else if (obj.optBoolean("isSuccess", false)) 1 else 2
+            
+            // Fix: If status is 0 (Downloading) on load, it means the app was killed/closed. 
+            // Mark it as failed so it doesn't stay stuck.
+            if (status == 0) {
+                status = 2
+            }
+
             val url = obj.optString("url", "")
             val origin = obj.optString("origin", "")
             
@@ -686,7 +907,8 @@ fun loadHistory(ctx: Context): List<DownloadHistory> {
                 obj.getLong("time"),
                 status,
                 url,
-                origin
+                origin,
+                if (status == 1) 1f else 0f
             ))
         }
     } catch (e: Exception) { e.printStackTrace() }
@@ -708,7 +930,7 @@ fun SimpleMediaDebugger(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     
-    val saveDir = "TikDownDebug" 
+    val saveDir = "videodownDebug" 
     val targetUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 
     var previewUrl by remember { mutableStateOf<String?>(null) }
@@ -734,7 +956,9 @@ fun SimpleMediaDebugger(
                             if (res != null) {
                                 val savedName = File(res).name
                                 history.add(0, DownloadHistory(savedName, res, System.currentTimeMillis(), 1, urlToDownload))
-                                saveHistory(context, history)
+                                withContext(Dispatchers.IO) {
+                                    saveHistory(context, history)
+                                }
                                 onDebugStatusChange("✅ 下载成功: $savedName")
                             } else {
                                 onDebugStatusChange("❌ 下载失败")
@@ -840,7 +1064,7 @@ fun SimpleMediaDebugger(
                                 webViewClient = object : WebViewClient() {
                                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                                         val u = request?.url?.toString() ?: ""
-                                        val isMedia = u.contains(".mp4") || u.contains(".webp") || 
+                                        val isMedia = u.contains(".mp4") || u.contains(".webp") || u.contains(".gif") ||
                                                       u.contains("video") || u.contains("douyinpic") || 
                                                       u.contains("aweme/v1/play")
                                         if (isMedia) {
