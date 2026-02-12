@@ -59,9 +59,23 @@ import java.util.concurrent.TimeUnit
 
 fun Modifier.verticalScrollbar(state: ScrollState): Modifier = drawWithContent {
     drawContent()
-    val length = size.height * (size.height / state.maxValue.toFloat().coerceAtLeast(size.height))
-    val offset = (state.value.toFloat() / state.maxValue.toFloat().coerceAtLeast(1f)) * (size.height - length)
-    drawRect(color = Color.Gray.copy(alpha = 0.5f), topLeft = Offset(size.width - 4.dp.toPx(), offset), size = Size(4.dp.toPx(), length))
+    val visibleHeight = size.height
+    val contentHeight = state.maxValue.toFloat() + visibleHeight
+    
+    if (state.maxValue > 0) {
+        val viewableRatio = visibleHeight / contentHeight
+        // Cap the scrollbar height at 90% of visible height so it always looks like a scrollbar
+        val scrollbarHeight = (visibleHeight * viewableRatio).coerceIn(20.dp.toPx(), visibleHeight * 0.9f)
+        
+        val scrollProgress = state.value.toFloat() / state.maxValue.toFloat()
+        val offset = scrollProgress * (visibleHeight - scrollbarHeight)
+        
+        drawRect(
+            color = Color.Gray.copy(alpha = 0.5f),
+            topLeft = Offset(size.width - 4.dp.toPx(), offset),
+            size = Size(4.dp.toPx(), scrollbarHeight)
+        )
+    }
 }
 
 fun Modifier.lazyVerticalScrollbar(state: LazyListState): Modifier = drawWithContent {
@@ -136,7 +150,7 @@ fun videodownApp() {
     var currentTab by remember { mutableIntStateOf(0) }
     val history = remember { mutableStateListOf<DownloadHistory>() }
     var saveDir by remember { mutableStateOf("videodownData") }
-    var selectedSource by remember { mutableStateOf("Bilibili") } // "Bilibili" or "Douyin"
+    var selectedSource by remember { mutableStateOf("Bilibili") } // "Bilibili", "Douyin" or "Twitter"
 
     // Hoisted State for Input
     var downloadInput by remember { mutableStateOf("") }
@@ -224,16 +238,28 @@ fun videodownApp() {
         }
     }
     
-    // Auto-Stop Monitor
+    // Auto-Stop Monitor with Timeout Safety
     LaunchedEffect(isRunning) {
         if (isRunning) {
             lastActivityTime = System.currentTimeMillis()
+            val startTime = System.currentTimeMillis()
             while (isActive && isRunning) {
                 delay(1000)
-                if (processedUrls.isNotEmpty() && (System.currentTimeMillis() - lastActivityTime > 8000)) {
+                val now = System.currentTimeMillis()
+                // 1. If we found something, and it's been quiet for 8s, we're done.
+                if (processedUrls.isNotEmpty() && (now - lastActivityTime > 8000)) {
                     isRunning = false
                     snifferUrl = null
-                    status = "✅ 自动完成 (无新内容)"
+                    status = "✅ 自动解析完成"
+                    break
+                }
+                // 2. Total duration safety (45s for slow sites like Twitter)
+                if (now - startTime > 45000) {
+                    val hadResults = processedUrls.isNotEmpty()
+                    isRunning = false
+                    snifferUrl = null
+                    status = if (hadResults) "✅ 已完成 (部分资源可能加载较慢)" else "⚠️ 解析超时，请尝试在“调试”页查看详情"
+                    break
                 }
             }
         }
@@ -249,22 +275,65 @@ fun videodownApp() {
             WebView(currentContext).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                settings.databaseEnabled = true
+                settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 settings.userAgentString = targetUA
                 addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun processJson(json: String) {
+                        if (!isRunning) return
+                        scope.launch(Dispatchers.Main) {
+                            try {
+                                val urlPattern = Pattern.compile("https?://video\\.twimg\\.com/[^\"\\s]+\\.mp4[^\"\\s]*")
+                                val unescapedJson = json.replace("\\/", "/")
+                                val urlMatcher = urlPattern.matcher(unescapedJson)
+                                var found = false
+                                while (urlMatcher.find()) {
+                                    val url = urlMatcher.group()
+                                    var bitrate = 0
+                                    val context = unescapedJson.substring(maxOf(0, urlMatcher.start() - 200), minOf(unescapedJson.length, urlMatcher.end() + 200))
+                                    val bitrateMatcher = Pattern.compile("\"bitrate\"\\s*:\\s*(\\d+)").matcher(context)
+                                    if (bitrateMatcher.find()) bitrate = bitrateMatcher.group(1).toInt()
+                                    
+                                    if (!processedUrls.contains(url)) {
+                                        processedUrls.add(url)
+                                        lastActivityTime = System.currentTimeMillis()
+                                        startDownloadTask(url, captureTitle, captureOrigin)
+                                        found = true
+                                    }
+                                }
+                                if (found) status = "已通过 API 捕获视频"
+                            } catch (e: Exception) {
+                                Log.e("videodown", "Twitter JSON Parse Error", e)
+                            }
+                        }
+                    }
+
                     @JavascriptInterface
                     fun processVideo(url: String) {
                         if (isRunning && url.isNotEmpty() && !url.startsWith("blob:")) {
                             scope.launch(Dispatchers.Main) {
                                 if (snifferUrl != null) {
-                                    // Bilibili specific: Strip image processing suffix (e.g., @344w_194h_1c.webp) to get original image
-                                    var finalMediaUrl = if (url.contains("hdslb.com") && url.contains("@")) {
-                                        url.substringBefore("@")
-                                    } else {
-                                        url
+                                    var finalMediaUrl = url
+                                    
+                                    // Bilibili specific: Strip image processing suffix
+                                    if (finalMediaUrl.contains("hdslb.com") && finalMediaUrl.contains("@")) {
+                                        finalMediaUrl = finalMediaUrl.substringBefore("@")
                                     }
 
                                     if (finalMediaUrl.contains("douyin.com") && !keepWatermark) {
                                         finalMediaUrl = finalMediaUrl.replace("playwm", "play")
+                                    }
+
+                                    // Twitter specific: Try to get original size for images
+                                    if (finalMediaUrl.contains("pbs.twimg.com/media/")) {
+                                        if (finalMediaUrl.contains("?format=")) {
+                                            if (!finalMediaUrl.contains("&name=orig")) {
+                                                finalMediaUrl = finalMediaUrl.substringBefore("&name=") + "&name=orig"
+                                            }
+                                        } else if (!finalMediaUrl.contains(":orig") && !finalMediaUrl.contains("?")) {
+                                             finalMediaUrl = "$finalMediaUrl:orig"
+                                        }
                                     }
                                     
                                     if (processedUrls.contains(finalMediaUrl)) return@launch
@@ -281,6 +350,18 @@ fun videodownApp() {
                 }, "SnifferBridge")
 
                 webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                        super.onPageStarted(view, url, favicon)
+                        status = "正在加载页面..."
+                    }
+
+                    override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                        super.onReceivedError(view, request, error)
+                        if (request?.isForMainFrame == true) {
+                            status = "加载失败: ${error?.description}"
+                        }
+                    }
+
                     override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                         val url = request?.url?.toString() ?: return false
                         return !url.startsWith("http")
@@ -288,70 +369,105 @@ fun videodownApp() {
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
+                        status = "页面加载完成，正在嗅探媒体资源..."
                         val js = """
-                            setInterval(function() {
-                                function processImg(img) {
-                                    var src = img.src;
-                                    var width = img.naturalWidth || img.width;
-                                    var height = img.naturalHeight || img.height;
-                                    if (src && width > 400 && height > 300) {
-                                        if (!src.includes('avatar') && !src.includes('emoji') && 
-                                            !src.includes('icon') && !src.includes('logo') && 
-                                            !src.includes('face') && !src.includes('brand')) {
-                                            SnifferBridge.processVideo(src);
+                            (function() {
+                                var oldXHR = window.XMLHttpRequest;
+                                function newXHR() {
+                                    var realXHR = new oldXHR();
+                                    realXHR.addEventListener('readystatechange', function() {
+                                        if(realXHR.readyState == 4 && realXHR.status == 200) {
+                                            var responseUrl = realXHR.responseURL || '';
+                                            if (responseUrl.includes('TweetDetail') || responseUrl.includes('TweetResultByRestId')) {
+                                                SnifferBridge.processJson(realXHR.responseText);
+                                            }
                                         }
-                                    }
+                                    }, false);
+                                    return realXHR;
                                 }
-                                var videos = document.getElementsByTagName('video');
-                                for (var i = 0; i < videos.length; i++) {
-                                    var src = videos[i].currentSrc || videos[i].src;
-                                    if (src) SnifferBridge.processVideo(src);
-                                }
-                                var potentialGalleries = [];
-                                var allElements = document.querySelectorAll('div, ul');
-                                for(var i=0; i<allElements.length; i++) {
-                                    var el = allElements[i];
-                                    if ((el.scrollWidth > el.clientWidth + 20) && el.clientWidth > 250 && el.clientHeight > 300) {
-                                         potentialGalleries.push(el);
+                                window.XMLHttpRequest = newXHR;
+
+                                var oldFetch = window.fetch;
+                                window.fetch = function() {
+                                    return oldFetch.apply(this, arguments).then(function(response) {
+                                        var responseUrl = response.url || '';
+                                        if (responseUrl.includes('TweetDetail') || responseUrl.includes('TweetResultByRestId')) {
+                                            var clonedResponse = response.clone();
+                                            clonedResponse.text().then(function(text) {
+                                                SnifferBridge.processJson(text);
+                                            });
+                                        }
+                                        return response;
+                                    });
+                                };
+
+                                setInterval(function() {
+                                    var videos = document.getElementsByTagName('video');
+                                    for (var i = 0; i < videos.length; i++) {
+                                        var src = videos[i].currentSrc || videos[i].src;
+                                        if (src) SnifferBridge.processVideo(src);
                                     }
-                                }
-                                if (potentialGalleries.length > 0) {
-                                    for(var i=0; i<potentialGalleries.length; i++) {
-                                        var el = potentialGalleries[i];
-                                        el.scrollLeft += 300;
-                                        var images = el.getElementsByTagName('img');
-                                        for(var j=0; j<images.length; j++) { processImg(images[j]); }
+                                    var sources = document.getElementsByTagName('source');
+                                    for (var i = 0; i < sources.length; i++) {
+                                        if (sources[i].src) SnifferBridge.processVideo(sources[i].src);
                                     }
-                                } else {
-                                    if (window.scrollY < 200) window.scrollBy(0, 20);
                                     var images = document.getElementsByTagName('img');
                                     for(var i=0; i<images.length; i++) {
-                                        var rect = images[i].getBoundingClientRect();
-                                        if (rect.top < window.innerHeight * 1.5) { processImg(images[i]); }
+                                        var src = images[i].src;
+                                        var width = images[i].naturalWidth || images[i].width;
+                                        if (src && width > 300) {
+                                            if (!src.includes('avatar') && !src.includes('emoji') && 
+                                                !src.includes('icon') && !src.includes('logo') && 
+                                                !src.includes('face') && !src.includes('brand') &&
+                                                !src.includes('profile_images')) {
+                                                SnifferBridge.processVideo(src);
+                                            }
+                                        }
                                     }
-                                }
-                            }, 2000);
+                                }, 2000);
+                            })();
                         """.trimIndent()
                         view?.evaluateJavascript(js, null)
                     }
 
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         val u = request?.url?.toString() ?: ""
+                        // Enhanced Twitter video detection (including m3u8 and various twimg patterns)
                         val isVideo = u.contains("aweme/v1/play/") || u.contains("video_id") || u.contains(".mp4") || 
-                                      u.contains("bilivideo.com") || (u.contains("video.twimg.com") && u.contains(".mp4"))
-                        val isLargeImage = (u.contains("douyinpic.com") || u.contains("hdslb.com") || u.matches(Regex(".*\\.(jpg|jpeg|webp|gif).*"))) && 
+                                      u.contains("bilivideo.com") || u.contains("video.twimg.com") || u.contains(".m3u8") ||
+                                      u.contains("ext_tw_video") || u.contains("amplify_video") || u.contains("/amplify-video/")
+                        
+                        // Enhanced Twitter/Large image detection
+                        val isLargeImage = (u.contains("douyinpic.com") || u.contains("hdslb.com") || u.contains("pbs.twimg.com/media/") || u.matches(Regex(".*\\.(jpg|jpeg|webp|gif).*"))) && 
                                            !u.contains(".png") && !u.contains("avatar") && !u.contains("emoji") && 
                                            !u.contains("icon") && !u.contains("logo") && !u.contains("face") && 
                                            !u.contains("banner") && !u.contains(".js") && !u.contains(".css") &&
+                                           !u.contains("profile_images") && !u.contains("profile_banners") && !u.contains("sticky_images") &&
                                            !u.contains("hdslb.com/bfs/archive/") && !u.contains("hdslb.com/bfs/cover/") &&
                                            !u.contains("hdslb.com/bfs/active/") && !u.contains("hdslb.com/bfs/article/")
-                        val isNoise = u.contains("log-upload") || u.contains("analytics") || u.contains("ads") || u.contains("doubleclick")
+                        
+                        val isNoise = u.contains("log-upload") || u.contains("analytics") || u.contains("ads") || u.contains("doubleclick") || u.contains("api/1.1/jot") || u.contains("card_fetch")
 
                         if ((isVideo || isLargeImage) && !isNoise) {
                             view?.post {
                                 if (isRunning) {
                                     var finalMediaUrl = if (u.contains("hdslb.com") && u.contains("@")) u.substringBefore("@") else u
-                                    if (finalMediaUrl.contains("douyin.com") && !keepWatermark) finalMediaUrl = finalMediaUrl.replace("playwm", "play")
+                                    
+                                    if (finalMediaUrl.contains("douyin.com") && !keepWatermark) {
+                                        finalMediaUrl = finalMediaUrl.replace("playwm", "play")
+                                    }
+
+                                    // Twitter specific: Try to get original size for images
+                                    if (finalMediaUrl.contains("pbs.twimg.com/media/")) {
+                                        if (finalMediaUrl.contains("?format=")) {
+                                            if (!finalMediaUrl.contains("&name=orig")) {
+                                                finalMediaUrl = finalMediaUrl.substringBefore("&name=") + "&name=orig"
+                                            }
+                                        } else if (!finalMediaUrl.contains(":orig") && !finalMediaUrl.contains("?")) {
+                                             finalMediaUrl = "$finalMediaUrl:orig"
+                                        }
+                                    }
+                                    
                                     if (!processedUrls.contains(finalMediaUrl)) {
                                         processedUrls.add(finalMediaUrl)
                                         lastActivityTime = System.currentTimeMillis()
@@ -363,6 +479,7 @@ fun videodownApp() {
                         return super.shouldInterceptRequest(view, request)
                     }
                 }
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                 loadUrl(snifferUrl!!)
             }
         }
@@ -470,12 +587,12 @@ fun DownloaderTab(
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(scrollState).verticalScrollbar(scrollState)) {
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(scrollState)) {
         Text("专下 B站 / 抖音", fontSize = 24.sp, fontWeight = FontWeight.Black)
         Spacer(modifier = Modifier.height(24.dp))
         Text("1. 选择来源平台", fontWeight = FontWeight.Bold, fontSize = 14.sp)
         Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("Bilibili", "Douyin").forEach { source ->
+            listOf("Bilibili", "Douyin", "Twitter").forEach { source ->
                 val isSelected = selectedSource == source
                 Surface(
                     modifier = Modifier.weight(1f).height(48.dp).clip(RoundedCornerShape(8.dp)).clickable { onSourceChange(source) },
@@ -484,7 +601,14 @@ fun DownloaderTab(
                     border = if (isSelected) null else BorderStroke(1.dp, Color.LightGray)
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        Text(if(source == "Bilibili") "哔哩哔哩" else "抖音视频", fontWeight = FontWeight.Bold)
+                        Text(
+                            text = when(source) {
+                                "Bilibili" -> "哔哩哔哩"
+                                "Douyin" -> "抖音视频"
+                                else -> "Twitter/X"
+                            },
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }
@@ -492,7 +616,21 @@ fun DownloaderTab(
         Spacer(modifier = Modifier.height(16.dp))
         Text("2. 粘贴分享链接", fontWeight = FontWeight.Bold, fontSize = 14.sp)
         Spacer(modifier = Modifier.height(8.dp))
-        OutlinedTextField(value = inputValue, onValueChange = onInputValueChange, placeholder = { Text("在此粘贴 $selectedSource 分享文本") }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp))
+        OutlinedTextField(
+            value = inputValue,
+            onValueChange = onInputValueChange,
+            placeholder = { 
+                Text(
+                    text = when(selectedSource) {
+                        "Bilibili" -> "在此粘贴 哔哩哔哩 分享文本"
+                        "Douyin" -> "在此粘贴 抖音 分享文本"
+                        else -> "在此粘贴 Twitter/X 分享链接"
+                    }
+                ) 
+            },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp)
+        )
         Spacer(modifier = Modifier.height(16.dp))
         if (selectedSource == "Douyin") {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { onKeepWatermarkChange(!keepWatermark) }) {
@@ -663,7 +801,7 @@ fun HistoryTab(history: List<DownloadHistory>, onRedownload: (DownloadHistory) -
 @Composable
 fun SettingsTab(dir: String, onUpdate: (String) -> Unit) {
     val scrollState = rememberScrollState()
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(scrollState).verticalScrollbar(scrollState)) {
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(scrollState)) {
         Text("设置", fontSize = 20.sp, fontWeight = FontWeight.Bold); Spacer(modifier = Modifier.height(24.dp))
         Text("存储路径: /Download/${dir}/"); OutlinedTextField(value = dir, onValueChange = onUpdate, modifier = Modifier.fillMaxWidth())
     }
@@ -690,6 +828,7 @@ suspend fun performDownload(ctx: Context, url: String, baseName: String, dir: St
             val referer = when {
                 url.contains("douyin.com") || url.contains("iesdouyin.com") -> "https://www.douyin.com/"
                 url.contains("bilibili.com") || url.contains("bilivideo.com") || url.contains("hdslb.com") -> "https://www.bilibili.com/"
+                url.contains("twitter.com") || url.contains("x.com") || url.contains("twimg.com") -> "https://x.com/"
                 else -> url
             }
             val cookie = CookieManager.getInstance().getCookie(url)
@@ -763,15 +902,21 @@ fun loadHistory(ctx: Context): List<DownloadHistory> {
 fun SimpleMediaDebugger(history: MutableList<DownloadHistory>, urlInput: String, onUrlInputChange: (String) -> Unit, sniffingUrl: String, onSniffingUrlChange: (String) -> Unit, debugStatus: String, onDebugStatusChange: (String) -> Unit, capturedUrls: SnapshotStateList<String>) {
     val clipboard = LocalClipboardManager.current; val context = LocalContext.current; val scope = rememberCoroutineScope()
     var previewUrl by remember { mutableStateOf<String?>(null) }
-    val scrollState = rememberScrollState()
+    val listState = rememberLazyListState()
+    val expandedSuffixes = remember { mutableStateMapOf<String, Boolean>() }
+    var selectedSource by remember { mutableStateOf("Bilibili") }
+    
+    val targetUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+
     if (previewUrl != null) {
+        // ... (保持现有 AlertDialog 逻辑不变)
         AlertDialog(onDismissRequest = { previewUrl = null }, confirmButton = { Row {
             Button(onClick = { clipboard.setText(androidx.compose.ui.text.AnnotatedString(previewUrl!!)); Toast.makeText(context, "链接已复制", Toast.LENGTH_SHORT).show() }) { Text("复制链接") }
             Spacer(modifier = Modifier.width(8.dp))
             Button(onClick = {
                 val urlToDownload = previewUrl!!; onDebugStatusChange("正在下载资源...")
                 scope.launch {
-                    val res = performDownload(context, urlToDownload, "debug_" + extractBaseFileName(urlInput), "videodownDebug", "Mozilla/5.0")
+                    val res = performDownload(context, urlToDownload, "debug_" + extractBaseFileName(urlInput), "videodownDebug", targetUA)
                     if (res != null) { history.add(0, DownloadHistory(File(res).name, res, System.currentTimeMillis(), 1, urlToDownload)); withContext(Dispatchers.IO) { saveHistory(context, history) }; onDebugStatusChange("✅ 下载成功") }
                     else { onDebugStatusChange("❌ 下载失败") }
                 }
@@ -779,18 +924,66 @@ fun SimpleMediaDebugger(history: MutableList<DownloadHistory>, urlInput: String,
             }) { Text("下载") }
         }}, dismissButton = { Button(onClick = { previewUrl = null }) { Text("关闭") } }, text = { Box(modifier = Modifier.fillMaxWidth().height(400.dp)) { AndroidView(factory = { ctx -> WebView(ctx).apply { settings.javaScriptEnabled = true; settings.domStorageEnabled = true; webViewClient = WebViewClient(); loadUrl(previewUrl!!) } }, modifier = Modifier.fillMaxSize()) } })
     }
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(scrollState).verticalScrollbar(scrollState)) {
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("资源抓包调试器", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        OutlinedTextField(value = urlInput, onValueChange = onUrlInputChange, label = { Text("粘贴 bilibili 或 抖音链接") }, modifier = Modifier.fillMaxWidth())
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("Bilibili", "Douyin", "Twitter").forEach { source ->
+                val isSelected = selectedSource == source
+                Surface(
+                    modifier = Modifier.weight(1f).height(40.dp).clip(RoundedCornerShape(8.dp)).clickable { selectedSource = source },
+                    color = if (isSelected) MaterialTheme.colorScheme.primary else Color(0xFFF5F5F5),
+                    contentColor = if (isSelected) Color.White else Color.Black,
+                    border = if (isSelected) null else BorderStroke(1.dp, Color.LightGray)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(text = if(source == "Bilibili") "B站" else if(source == "Douyin") "抖音" else "Twitter", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        OutlinedTextField(value = urlInput, onValueChange = onUrlInputChange, label = { Text("粘贴待调试的链接") }, modifier = Modifier.fillMaxWidth())
         Spacer(modifier = Modifier.height(8.dp))
         Button(onClick = { val clipText = clipboard.getText()?.text ?: ""; onUrlInputChange(clipText.toString()); val extracted = extractUrl(clipText.toString()); if (!extracted.isNullOrBlank()) { capturedUrls.clear(); onSniffingUrlChange(extracted); onDebugStatusChange("正在嗅探: $extracted") } }, modifier = Modifier.fillMaxWidth()) { Text("粘贴并开始抓包") }
         Spacer(modifier = Modifier.height(8.dp)); Text(debugStatus, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, maxLines = 1)
         
-        Column(modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp).background(Color(0xFFF5F5F5)).padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            capturedUrls.forEach { url -> 
-                Box(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(Color.White).border(1.dp, Color.LightGray, RoundedCornerShape(8.dp)).clickable { previewUrl = url }.padding(12.dp)) { 
-                    Text(text = url, fontSize = 10.sp, color = if (url.contains(".mp4") || url.contains("play")) Color.Blue else Color.DarkGray) 
-                } 
+        val groupedUrls = remember(capturedUrls.toList()) {
+            capturedUrls.groupBy { url ->
+                try {
+                    val path = if (url.contains("?")) url.substringBefore("?") else url
+                    val dotIndex = path.lastIndexOf('.')
+                    if (dotIndex != -1 && dotIndex < path.length - 1) {
+                         val ext = path.substring(dotIndex + 1).lowercase()
+                         if (ext.length <= 5 && ext.all { it.isLetterOrDigit() }) ext else "other"
+                    } else "other"
+                } catch (e: Exception) { "other" }
+            }
+        }
+
+        LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f).background(Color(0xFFF5F5F5)).padding(8.dp).lazyVerticalScrollbar(listState), state = listState, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            groupedUrls.forEach { (suffix, urls) ->
+                item {
+                    val isExpanded = expandedSuffixes[suffix] ?: false
+                    Column(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(Color.White)) {
+                         Row(modifier = Modifier.fillMaxWidth().clickable { expandedSuffixes[suffix] = !isExpanded }.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                             Text(text = ".$suffix (${urls.size})", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                             Icon(if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, "Expand")
+                         }
+                    }
+                }
+                if (expandedSuffixes[suffix] == true) {
+                    items(urls) { url ->
+                        Column(modifier = Modifier.fillMaxWidth().background(Color.White)) {
+                            Box(modifier = Modifier.fillMaxWidth().clickable { previewUrl = url }.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                                Text(text = url, fontSize = 10.sp, color = if (url.contains(".mp4") || url.contains("play")) Color.Blue else Color.DarkGray)
+                            }
+                            Divider(color = Color.LightGray.copy(alpha = 0.5f), modifier = Modifier.padding(horizontal = 12.dp))
+                        }
+                    }
+                }
             }
         }
         
@@ -799,15 +992,119 @@ fun SimpleMediaDebugger(history: MutableList<DownloadHistory>, urlInput: String,
                 key(sniffingUrl) { 
                     AndroidView(factory = { ctx -> 
                         WebView(ctx).apply { 
-                            settings.javaScriptEnabled = true; settings.domStorageEnabled = true; webViewClient = object : WebViewClient() { 
+                            settings.javaScriptEnabled = true; settings.domStorageEnabled = true
+                            settings.userAgentString = targetUA
+                            addJavascriptInterface(object {
+                                @JavascriptInterface
+                                fun processJson(json: String) {
+                                    scope.launch(Dispatchers.Main) {
+                                        try {
+                                            val urlPattern = Pattern.compile("https?://video\\.twimg\\.com/[^\"\\s]+\\.mp4[^\"\\s]*")
+                                            val unescapedJson = json.replace("\\/", "/")
+                                            val urlMatcher = urlPattern.matcher(unescapedJson)
+                                            while (urlMatcher.find()) {
+                                                val url = urlMatcher.group()
+                                                if (!capturedUrls.contains(url)) capturedUrls.add(0, url)
+                                            }
+                                        } catch (e: Exception) {}
+                                    }
+                                }
+
+                                @JavascriptInterface
+                                fun processVideo(url: String) {
+                                    scope.launch(Dispatchers.Main) {
+                                        var finalMediaUrl = url
+                                        if (finalMediaUrl.contains("hdslb.com") && finalMediaUrl.contains("@")) finalMediaUrl = finalMediaUrl.substringBefore("@")
+                                        if (finalMediaUrl.contains("pbs.twimg.com/media/")) {
+                                            if (finalMediaUrl.contains("?format=")) {
+                                                if (!finalMediaUrl.contains("&name=orig")) finalMediaUrl = finalMediaUrl.substringBefore("&name=") + "&name=orig"
+                                            } else if (!finalMediaUrl.contains(":orig") && !finalMediaUrl.contains("?")) finalMediaUrl = "$finalMediaUrl:orig"
+                                        }
+                                        if (!capturedUrls.contains(finalMediaUrl)) capturedUrls.add(0, finalMediaUrl)
+                                    }
+                                }
+                            }, "SnifferBridge")
+
+                            webViewClient = object : WebViewClient() { 
+                                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                                    super.onPageStarted(view, url, favicon)
+                                    onDebugStatusChange("正在加载页面...")
+                                }
+
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    onDebugStatusChange("页面加载完成，等待嗅探...")
+                                    val js = """
+                                        (function() {
+                                            var oldXHR = window.XMLHttpRequest;
+                                            function newXHR() {
+                                                var realXHR = new oldXHR();
+                                                realXHR.addEventListener('readystatechange', function() {
+                                                    if(realXHR.readyState == 4 && realXHR.status == 200) {
+                                                        var responseUrl = realXHR.responseURL || '';
+                                                        if (responseUrl.includes('TweetDetail') || responseUrl.includes('TweetResultByRestId')) {
+                                                            SnifferBridge.processJson(realXHR.responseText);
+                                                        }
+                                                    }
+                                                }, false);
+                                                return realXHR;
+                                            }
+                                            window.XMLHttpRequest = newXHR;
+
+                                            var oldFetch = window.fetch;
+                                            window.fetch = function() {
+                                                return oldFetch.apply(this, arguments).then(function(response) {
+                                                    var responseUrl = response.url || '';
+                                                    if (responseUrl.includes('TweetDetail') || responseUrl.includes('TweetResultByRestId')) {
+                                                        var clonedResponse = response.clone();
+                                                        clonedResponse.text().then(function(text) { SnifferBridge.processJson(text); });
+                                                    }
+                                                    return response;
+                                                });
+                                            };
+
+                                            setInterval(function() {
+                                                var videos = document.getElementsByTagName('video');
+                                                for (var i = 0; i < videos.length; i++) {
+                                                    var src = videos[i].currentSrc || videos[i].src;
+                                                    if (src) SnifferBridge.processVideo(src);
+                                                }
+                                                var images = document.getElementsByTagName('img');
+                                                for(var i=0; i<images.length; i++) {
+                                                    var src = images[i].src;
+                                                    if (src && (images[i].naturalWidth > 300)) {
+                                                        SnifferBridge.processVideo(src);
+                                                    }
+                                                }
+                                            }, 2000);
+                                        })();
+                                    """.trimIndent()
+                                    view?.evaluateJavascript(js, null)
+                                }
+
+                                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                                    super.onReceivedError(view, request, error)
+                                    if (request?.isForMainFrame == true) {
+                                        onDebugStatusChange("加载失败: ${error?.description}")
+                                    }
+                                }
+
                                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? { 
                                     val u = request?.url?.toString() ?: ""; 
-                                    val isBiliImage = u.contains("hdslb.com/bfs/archive/") || u.contains("hdslb.com/bfs/cover/") || u.contains("hdslb.com/bfs/active/")
-                                    if ((u.contains(".mp4") || u.contains(".webp") || u.contains("video") || u.contains("aweme/v1/play")) && !isBiliImage) { 
-                                        post { if (!capturedUrls.contains(u)) capturedUrls.add(0, u) } 
-                                    }; return super.shouldInterceptRequest(view, request) 
+                                    post { 
+                                        if (!capturedUrls.contains(u)) {
+                                            capturedUrls.add(0, u)
+                                            // Update status when a media-like resource is found
+                                            if (u.contains(".mp4") || u.contains("video") || u.contains(".m3u8")) {
+                                                onDebugStatusChange("已发现媒体资源!")
+                                            }
+                                        }
+                                    }
+                                    return super.shouldInterceptRequest(view, request) 
                                 } 
-                            }; loadUrl(sniffingUrl) 
+                            }; 
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                            loadUrl(sniffingUrl) 
                         } 
                     }) 
                 } 
