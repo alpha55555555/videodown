@@ -171,15 +171,49 @@ fun videodownApp() {
     var pendingBaseName by remember { mutableStateOf("Media") }
     val processedUrls = remember { mutableStateListOf<String>() }
     var lastActivityTime by remember { mutableLongStateOf(0L) }
+    var isHistoryLoaded by remember { mutableStateOf(false) }
+    var currentSniffingTimestamp by remember { mutableLongStateOf(0L) }
     
     val scope = rememberCoroutineScope()
     val targetUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+
+    val performSniffing: (String, String, String) -> Unit = { url, baseName, origin ->
+        if (isRunning) {
+            Toast.makeText(context, "已有任务正在解析中...", Toast.LENGTH_SHORT).show()
+        } else {
+            pendingBaseName = baseName
+            processingOrigin = origin
+            processedUrls.clear()
+            isRunning = true
+            status = "正在启动嗅探 ($selectedSource)..."
+            snifferUrl = url
+
+            // Add a placeholder record for the parsing process immediately
+            val sniffingItem = DownloadHistory(
+                name = "[解析中] $baseName",
+                path = "",
+                time = System.currentTimeMillis(),
+                status = 0,
+                url = url,
+                origin = origin,
+                progress = 0.1f
+            )
+            currentSniffingTimestamp = sniffingItem.time
+            history.add(0, sniffingItem)
+            if (isHistoryLoaded) {
+                scope.launch(Dispatchers.IO) {
+                    saveHistory(context, history)
+                }
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
             val saved = loadHistory(context)
             withContext(Dispatchers.Main) {
                 history.addAll(saved)
+                isHistoryLoaded = true
             }
         }
     }
@@ -192,6 +226,14 @@ fun videodownApp() {
             val tempName = "${baseName}...".replace("Media...", "Media...")
             val newItem = DownloadHistory(tempName, "", System.currentTimeMillis(), 0, url, originUrl, 0f)
             history.add(0, newItem)
+            
+            // Save immediately when added to ensure it's not lost if app is killed
+            // CRITICAL: Only save if history has been loaded to avoid overwriting with partial list
+            if (isHistoryLoaded) {
+                withContext(Dispatchers.IO) {
+                    saveHistory(context, history)
+                }
+            }
             
             try {
                 val tempFilePrefix = "${baseName}_${System.currentTimeMillis() % 100000}"
@@ -214,14 +256,18 @@ fun videodownApp() {
                         history[index] = newItem.copy(name = savedName, path = res, status = finalStatus, progress = 1f)
                         status = if (isPlayable) "✅ 下载成功: $savedName" else "⚠️ 捕获到无效资源 (已自动归类)"
                         
-                        withContext(Dispatchers.IO) {
-                            saveHistory(context, history)
+                        if (isHistoryLoaded) {
+                            withContext(Dispatchers.IO) {
+                                saveHistory(context, history)
+                            }
                         }
                     } else {
                         history[index] = newItem.copy(status = 2, progress = 0f)
                         status = "❌ 下载失败 (资源无效或网络错误)"
-                        withContext(Dispatchers.IO) {
-                            saveHistory(context, history)
+                        if (isHistoryLoaded) {
+                            withContext(Dispatchers.IO) {
+                                saveHistory(context, history)
+                            }
                         }
                     }
                 }
@@ -230,8 +276,10 @@ fun videodownApp() {
                 val index = history.indexOfFirst { it.time == newItem.time }
                 if (index != -1) {
                     history[index] = newItem.copy(status = 2, progress = 0f)
-                    withContext(Dispatchers.IO) {
-                        saveHistory(context, history)
+                    if (isHistoryLoaded) {
+                        withContext(Dispatchers.IO) {
+                            saveHistory(context, history)
+                        }
                     }
                 }
             }
@@ -240,25 +288,52 @@ fun videodownApp() {
     
     // Auto-Stop Monitor with Timeout Safety
     LaunchedEffect(isRunning) {
+        if (!isRunning && currentSniffingTimestamp != 0L) {
+            val idx = history.indexOfFirst { it.time == currentSniffingTimestamp }
+            if (idx != -1) {
+                val item = history[idx]
+                val finalStatus = if (processedUrls.isNotEmpty()) 1 else 3
+                val finalName = if (processedUrls.isNotEmpty()) item.name.replace("[解析中]", "[解析完成]") else item.name.replace("[解析中]", "[未发现资源]")
+                history[idx] = item.copy(name = finalName, status = finalStatus, progress = 1f)
+                if (isHistoryLoaded) {
+                    withContext(Dispatchers.IO) {
+                        saveHistory(context, history)
+                    }
+                }
+            }
+            currentSniffingTimestamp = 0L
+        }
+
         if (isRunning) {
             lastActivityTime = System.currentTimeMillis()
             val startTime = System.currentTimeMillis()
             while (isActive && isRunning) {
                 delay(1000)
                 val now = System.currentTimeMillis()
-                // 1. If we found something, and it's been quiet for 8s, we're done.
-                if (processedUrls.isNotEmpty() && (now - lastActivityTime > 8000)) {
+                
+                // Update progress for the sniffing task
+                val sniffingIdx = history.indexOfFirst { it.time == currentSniffingTimestamp }
+                if (sniffingIdx != -1) {
+                    val currentItem = history[sniffingIdx]
+                    if (currentItem.progress < 0.9f) {
+                        history[sniffingIdx] = currentItem.copy(progress = currentItem.progress + 0.05f)
+                    }
+                }
+
+                // 1. If we found something, and it's been quiet for a while, we're done.
+                // Increased quiet time to 12s for better reliability (especially for Douyin)
+                if (processedUrls.isNotEmpty() && (now - lastActivityTime > 12000)) {
                     isRunning = false
                     snifferUrl = null
                     status = "✅ 自动解析完成"
                     break
                 }
-                // 2. Total duration safety (45s for slow sites like Twitter)
-                if (now - startTime > 45000) {
+                // 2. Total duration safety (60s for slow sites)
+                if (now - startTime > 60000) {
                     val hadResults = processedUrls.isNotEmpty()
                     isRunning = false
                     snifferUrl = null
-                    status = if (hadResults) "✅ 已完成 (部分资源可能加载较慢)" else "⚠️ 解析超时，请尝试在“调试”页查看详情"
+                    status = if (hadResults) "✅ 已完成 (部分资源可能加载较慢)" else "⚠️ 解析超时"
                     break
                 }
             }
@@ -521,20 +596,21 @@ fun videodownApp() {
                         onStop = { isRunning = false; snifferUrl = null; status = "已手动停止" },
                         onKeepWatermarkChange = { keepWatermark = it },
                         onStartDownload = { url, baseName, origin ->
-                            pendingBaseName = baseName
-                            processingOrigin = origin
-                            processedUrls.clear()
-                            isRunning = true
-                            status = "正在启动嗅探 ($selectedSource)..."
-                            snifferUrl = url
+                            performSniffing(url, baseName, origin)
+                            // Switch to History tab immediately
+                            currentTab = 1
                         }
                     )
                     1 -> HistoryTab(history = history, onRedownload = { item -> 
                         if (item.origin.isNotBlank()) {
-                            downloadInput = item.origin
-                            currentTab = 0
-                            autoTriggerDownload = true
-                            Toast.makeText(context, "正在重新解析下载...", Toast.LENGTH_SHORT).show()
+                            val url = extractUrl(item.origin)
+                            val baseName = extractBaseFileName(item.origin)
+                            if (url != null) {
+                                performSniffing(url, baseName, item.origin)
+                                Toast.makeText(context, "正在重新解析下载...", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "无法重新解析：无效链接", Toast.LENGTH_SHORT).show()
+                            }
                         } else {
                             Toast.makeText(context, "无法重新解析：原链接丢失", Toast.LENGTH_LONG).show()
                         }
@@ -592,7 +668,7 @@ fun DownloaderTab(
         Spacer(modifier = Modifier.height(24.dp))
         Text("1. 选择来源平台", fontWeight = FontWeight.Bold, fontSize = 14.sp)
         Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("Bilibili", "Douyin", "Twitter").forEach { source ->
+            listOf("Douyin", "Bilibili", "Twitter").forEach { source ->
                 val isSelected = selectedSource == source
                 Surface(
                     modifier = Modifier.weight(1f).height(48.dp).clip(RoundedCornerShape(8.dp)).clickable { onSourceChange(source) },
@@ -639,38 +715,39 @@ fun DownloaderTab(
             }
             Spacer(modifier = Modifier.height(8.dp))
         }
-        if (isRunning) {
-            Surface(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(12.dp)) {
-                Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
-                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text("后台正在全力解析中...", fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                    Spacer(modifier = Modifier.width(12.dp))
-                    TextButton(onClick = onStop) { Text("停止") }
-                }
-            }
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(status, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 2)
+        
         Spacer(modifier = Modifier.weight(1f))
-        Button(
-            onClick = {
-                val clipText = clipboard.getText()?.text?.toString() ?: ""
-                val clipUrl = extractUrl(clipText)
-                val inputUrl = extractUrl(inputValue)
-                val useClipboard = clipText.isNotBlank() && (inputValue.isBlank() || (clipUrl != null && clipUrl != inputUrl))
-                val inputToUse = if (useClipboard) { onInputValueChange(clipText); clipText } else { inputValue }
-                if (inputToUse.isNotBlank()) {
-                    val url = extractUrl(inputToUse)
-                    val baseName = extractBaseFileName(inputToUse)
-                    if (url != null) { onStartDownload(url, baseName, inputToUse) } else { Toast.makeText(context, "未检测到有效链接", Toast.LENGTH_SHORT).show() }
-                } else { Toast.makeText(context, "内容为空", Toast.LENGTH_SHORT).show() }
-            },
-            modifier = Modifier.fillMaxWidth().height(56.dp), shape = RoundedCornerShape(12.dp)
-        ) {
-            Icon(Icons.Default.ContentPaste, null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("立即解析并下载", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = {
+                    if (inputValue.isNotBlank()) {
+                        val url = extractUrl(inputValue)
+                        val baseName = extractBaseFileName(inputValue)
+                        if (url != null) { onStartDownload(url, baseName, inputValue) } else { Toast.makeText(context, "未检测到有效链接", Toast.LENGTH_SHORT).show() }
+                    } else { Toast.makeText(context, "请输入链接", Toast.LENGTH_SHORT).show() }
+                },
+                modifier = Modifier.weight(1f).height(56.dp), shape = RoundedCornerShape(12.dp)
+            ) {
+                Text("下载", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            }
+            
+            Button(
+                onClick = {
+                    val clipText = clipboard.getText()?.text?.toString() ?: ""
+                    if (clipText.isNotBlank()) {
+                        onInputValueChange(clipText)
+                        val url = extractUrl(clipText)
+                        val baseName = extractBaseFileName(clipText)
+                        if (url != null) { onStartDownload(url, baseName, clipText) } else { Toast.makeText(context, "剪贴板中未检测到有效链接", Toast.LENGTH_SHORT).show() }
+                    } else { Toast.makeText(context, "剪贴板为空", Toast.LENGTH_SHORT).show() }
+                },
+                modifier = Modifier.weight(1.5f).height(56.dp), shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.ContentPaste, null)
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("粘贴并下载", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            }
         }
     }
 }
